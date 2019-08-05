@@ -1,3 +1,4 @@
+#include "KaleidoscopeJIT.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -5,11 +6,14 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/TargetSelect.h"
+#include "llvm/Target/TargetMachine.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 
@@ -388,7 +392,7 @@ static std::unique_ptr<Prototype> parse_extern() {
 // toplevelexpression -> expression
 static std::unique_ptr<Function> parse_top_level_expression() {
   if (auto e = parse_expression()) {
-    auto proto = llvm::make_unique<Prototype>("", std::vector<std::string>());
+    auto proto = llvm::make_unique<Prototype>("__anon_expr", std::vector<std::string>());
     return llvm::make_unique<Function>(std::move(proto), std::move(e));
   }
   return nullptr;
@@ -404,12 +408,15 @@ static llvm::LLVMContext TheContext;
 static llvm::IRBuilder<> Builder(TheContext);
 // owns memory for values and functions and global variables. its 
 // handling of memory means that Value is a naked ptr and not a
-// std::unique_ptr.
 static std::unique_ptr<llvm::Module> TheModule;
 // our symbol table. as it stands this wil only hold function params.
 static std::map<std::string, Value*> NamedValues;
 // our optimizer passer
 static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+// the JIT compiler
+static std::unique_ptr<llvm::orc::KaleidoscopeJIT> TheJIT;
+// maps names to their most recent function declarations
+static std::map<std::string, std::unique_ptr<Prototype>> FunctionProtos;
 
 Value* log_error_v(const char* str) {
   log_error(str);
@@ -421,6 +428,7 @@ Value* log_error_v(const char* str) {
 void InitializeModuleAndPassManager(void) {
   // open a new module
   TheModule = llvm::make_unique<llvm::Module>("my cool jit", TheContext);
+  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
 
   // associate a pass manager
   TheFPM = llvm::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
@@ -475,8 +483,21 @@ Value* BinaryExpr::codegen() {
   }
 }
 
+llvm::Function* getFunction(std::string name) {
+  // Is it in the current module?
+  if (auto* F = TheModule->getFunction(name))
+    return F;
+
+  // Does it exist somewhere else?
+  auto where = FunctionProtos.find(name);
+  if (where != FunctionProtos.end())
+    return where->second->codegen();
+
+  return nullptr;
+}
+
 Value* CallExpr::codegen() {
-  llvm::Function* callee_fn = TheModule->getFunction(callee);
+  llvm::Function* callee_fn = getFunction(callee);
   
   if ( ! callee_fn )
     return log_error_v("unknown function reference");
@@ -519,11 +540,13 @@ llvm::Function* Prototype::codegen() {
 }
 
 llvm::Function* Function::codegen() {
-  // look for an existing `extern` function.
-  llvm::Function* the_function = TheModule->getFunction(proto->getName());
+  // Get its name.
+  std::string name = proto->getName();
+  // Transfer ownership.
+  FunctionProtos[proto->getName()] = std::move(proto);
+  // look it up.
+  llvm::Function* the_function = getFunction(name);
   
-  if( ! the_function)
-    the_function = proto->codegen();
   if ( ! the_function)
     return nullptr; // we failed.
   if ( ! the_function->empty() )
@@ -562,9 +585,10 @@ static void handle_definition() {
   if (auto fn = parse_definition()) {
     if (auto fnir = fn->codegen()) {
       fprintf(stderr, "Read function definition: ");
-      fnir->print(llvm::errs());
+      // fnir->print(llvm::errs());
       fprintf(stderr, "\n");
-      //  InitializeModuleAndPassManager();
+      TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
     }
   }
   else
@@ -575,8 +599,9 @@ static void handle_extern() {
   if (auto pr = parse_extern()) {
     if (auto fnir = pr->codegen()) {
       fprintf(stderr, "Read extern: ");
-      fnir->print(llvm::errs());
+      // fnir->print(llvm::errs());
       fprintf(stderr, "\n");
+      FunctionProtos[pr->getName()] = std::move(pr);
     }
   }
   else
@@ -585,11 +610,22 @@ static void handle_extern() {
 
 static void handle_top_level_expression() {
   if (auto fn = parse_top_level_expression()) {
-    if (auto fnir = fn->codegen()) {
-      //      InitializeModuleAndPassManager();
-      fprintf(stderr, "Read top level expression.");
-      fnir->print(llvm::errs());
-      fprintf(stderr, "\n");
+    if (fn->codegen()) {
+      // JIT the module containing the anonymous expression, keep a
+      // handle so that we can free later.
+      auto H = TheJIT->addModule(std::move(TheModule));
+      InitializeModuleAndPassManager();
+
+      // Search the JIT for the __anon_expr symbol.
+      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+      assert(ExprSymbol && "Function not found");
+
+      // Get the symbol's address and cast it to the right type (takes no
+      // arguments, returns a double) so we can call it as a native function.
+      double (*FP)() = (double (*)())(intptr_t)(ExprSymbol.getAddress().get());
+      fprintf(stderr, "Evaluated to %f\n", FP());
+
+      TheJIT->removeModule(H);
     }
   }
   else
@@ -619,6 +655,11 @@ static void main_loop() {
 }
 
 int main() {
+  // Set up llvm for our machine
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
+
   // install standard binary operators.
   // 1 is lowest.
   bop_precedence['<'] = 10;
@@ -630,8 +671,7 @@ int main() {
   fprintf(stderr, "ready> ");
   next_tok(); // prime token
 
-  //  InitializeModuleAndPassManager();
-  //  TheModule = llvm::make_unique<llvm::Module>("my cool JIT", TheContext);
+  TheJIT = llvm::make_unique<llvm::orc::KaleidoscopeJIT>();
   InitializeModuleAndPassManager();
 
   main_loop();
@@ -640,5 +680,3 @@ int main() {
 
   return 0;
 }
-
-
