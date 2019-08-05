@@ -5,10 +5,13 @@
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LegacyPassManager.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Type.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Transforms/Scalar.h"
+#include "llvm/Transforms/Scalar/GVN.h"
 
 #include <string>
 #include <vector>
@@ -406,7 +409,7 @@ static std::unique_ptr<llvm::Module> TheModule;
 // our symbol table. as it stands this wil only hold function params.
 static std::map<std::string, Value*> NamedValues;
 // our optimizer passer
-// std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+static std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
 
 Value* log_error_v(const char* str) {
   log_error(str);
@@ -415,24 +418,24 @@ Value* log_error_v(const char* str) {
 
 /* ===---- optimization ---=== */
 
-// void InitializeModuleAndPassManager(void) {
-//   // open a new module
-//   TheModule = llvm::make_unique<llvm::Module>("my cool jit", TheContext);
+void InitializeModuleAndPassManager(void) {
+  // open a new module
+  TheModule = llvm::make_unique<llvm::Module>("my cool jit", TheContext);
 
-//   // associate a pass manager
-//   TheFPM = llvm::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+  // associate a pass manager
+  TheFPM = llvm::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
 
-//   // Do simple "peephole" optimizations and bit-twiddling optzns.
-//   TheFPM->add(llvm::createInstructionCombiningPass());
-//   // Reassociate expressions.
-//   TheFPM->add(llvm::createReassociatePass());
-//   // Eliminate Common SubExpressions.
-//   TheFPM->add(llvm::createGVNPass());
-//   // Simplify the control flow graph (deleting unreachable blocks, etc).
-//   TheFPM->add(llvm::createCFGSimplificationPass());
+  // Do simple "peephole" optimizations and bit-twiddling optzns.
+  TheFPM->add(llvm::createInstructionCombiningPass());
+  // Reassociate expressions.
+  TheFPM->add(llvm::createReassociatePass());
+  // Eliminate Common SubExpressions.
+  TheFPM->add(llvm::createGVNPass());
+  // Simplify the control flow graph (deleting unreachable blocks, etc).
+  TheFPM->add(llvm::createCFGSimplificationPass());
 
-//   TheFPM->doInitialization();
-// }
+  TheFPM->doInitialization();
+}
 
 /* ===------ code gen -----=== */
 
@@ -540,7 +543,7 @@ llvm::Function* Function::codegen() {
     // Validate the generated code with some llvm magic.
     llvm::verifyFunction(*the_function);
 
-    // TheFPM->run(*the_function);
+    TheFPM->run(*the_function);
 
     return the_function;
   }
@@ -628,8 +631,8 @@ int main() {
   next_tok(); // prime token
 
   //  InitializeModuleAndPassManager();
-  TheModule = llvm::make_unique<llvm::Module>("my cool JIT", TheContext);
-
+  //  TheModule = llvm::make_unique<llvm::Module>("my cool JIT", TheContext);
+  InitializeModuleAndPassManager();
 
   main_loop();
 
