@@ -1,0 +1,19 @@
+============
+Kaleidoscope
+============
+
+This pretty closely follows LLVM's kaleidoscope tutorial. Other than
+some tiny changes to variable names and namespaces its actually pretty
+much the same. There are also some additional comments that I've
+written as a reference to myself later. You can find the tutorial in
+question at the link below. I'm quite liking it so far.
+
+https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html
+
+If you'd like to run this code or use it yourself, either go on the
+turorial link and scroll down to where it says how to compile this, or
+run the following command:
+
+`clang++ -g -O3 kaleidoscope.cpp `llvm-config --cxxflags --ldflags \
+--system-libs --libs core` -o kaleidoscope`
+
