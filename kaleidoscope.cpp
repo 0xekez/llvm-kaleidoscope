@@ -1,10 +1,21 @@
-#ifndef kaleidoscope_h
-#define kaleidoscope_h
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/LLVMContext.h"
+#include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/Verifier.h"
 
 #include <string>
 #include <vector>
 #include <memory>
 #include <map>
+
+using Value = llvm::Value;
 
 /* ===--------------------=== */
 /* ===------- lexer ------=== */
@@ -100,6 +111,7 @@ static int get_next_tok() {
 class Expr {
 public:
   virtual ~Expr() {}
+  virtual Value *codegen() = 0;
 };
 // exotic, I know
 
@@ -108,6 +120,7 @@ private:
   double val;
 public:
   NumberExpr(double val): val(val) {}
+  Value *codegen() override;
 };
 
 class VarExpr : public Expr {
@@ -116,6 +129,7 @@ private:
 public:
   // TODO(zeke): take ownership?
   VarExpr(const std::string& name): name(name) {}
+  Value *codegen() override;
 };
 
 class BinaryExpr : public Expr {
@@ -126,6 +140,7 @@ public:
   BinaryExpr(char op, std::unique_ptr<Expr> left,
 	     std::unique_ptr<Expr> right):
     op(op), left(std::move(left)), right(std::move(right)) {}
+  Value *codegen() override;
 };
 
 class CallExpr : public Expr {
@@ -136,6 +151,7 @@ public:
   CallExpr(const std::string& callee,
 	   std::vector<std::unique_ptr<Expr>> args):
     callee(callee), args(std::move(args)) {}
+  Value *codegen() override;
 };
 
 // the "prototype" for a function. captures its name, argument names,
@@ -147,6 +163,8 @@ private:
 public:
   Prototype(const std::string& name, std::vector<std::string> args):
     name(name), args(args) {}
+  llvm::Function* codegen();
+  std::string getName() { return name; }
 };
 
 // the actual function definition. functions own their prototypes.
@@ -158,6 +176,7 @@ public:
   Function(std::unique_ptr<Prototype> proto,
 	   std::unique_ptr<Expr> body):
     proto(std::move(proto)), body(std::move(body)) {}
+  llvm::Function* codegen();
 };
 
 /* ===--------------------=== */
@@ -186,7 +205,7 @@ std::unique_ptr<Prototype> log_error_p(const char* str) {
 
 // NumberExpr -> number
 static std::unique_ptr<Expr> parse_number() {
-  auto result = std::make_unique<NumberExpr>(current_num_val);
+  auto result = llvm::make_unique<NumberExpr>(current_num_val);
   // consume the number
   next_tok();
   return std::move(result);
@@ -216,7 +235,7 @@ static std::unique_ptr<Expr> parse_id() {
   next_tok(); // eat id
 
   if (current_tok != '(')
-    return std::make_unique<VarExpr>(std::move(name));
+    return llvm::make_unique<VarExpr>(std::move(name));
   
   // a call!
   next_tok(); // eat '('
@@ -238,7 +257,7 @@ static std::unique_ptr<Expr> parse_id() {
 
   next_tok(); // eat ')'
 
-  return std::make_unique<CallExpr>(std::move(name), std::move(args));
+  return llvm::make_unique<CallExpr>(std::move(name), std::move(args));
 }
 
 // primary ->
@@ -305,7 +324,7 @@ static std::unique_ptr<Expr> parse_b_op_right(int prec,
 	return nullptr;
     }
     // we get it.
-    left = std::make_unique<BinaryExpr>(bin_op, std::move(left),
+    left = llvm::make_unique<BinaryExpr>(bin_op, std::move(left),
 					std::move(right));
   } // while
 }
@@ -342,7 +361,7 @@ static std::unique_ptr<Prototype> parse_prototype() {
   
   next_tok(); // eat ')'
 
-  return std::make_unique<Prototype>(std::move(fn_name), std::move(arg_names));
+  return llvm::make_unique<Prototype>(std::move(fn_name), std::move(arg_names));
 }
 
 // definition -> 'def' prototype expression
@@ -352,7 +371,7 @@ static std::unique_ptr<Function> parse_definition(){
   if ( ! proto ) return nullptr;
 
   if ( auto e = parse_expression() )
-    return std::make_unique<Function>(std::move(proto), std::move(e));
+    return llvm::make_unique<Function>(std::move(proto), std::move(e));
 
   return nullptr;
 }
@@ -366,29 +385,210 @@ static std::unique_ptr<Prototype> parse_extern() {
 // toplevelexpression -> expression
 static std::unique_ptr<Function> parse_top_level_expression() {
   if (auto e = parse_expression()) {
-    auto proto = std::make_unique<Prototype>("", std::vector<std::string>());
-    return std::make_unique<Function>(std::move(proto), std::move(e));
+    auto proto = llvm::make_unique<Prototype>("", std::vector<std::string>());
+    return llvm::make_unique<Function>(std::move(proto), std::move(e));
   }
   return nullptr;
 }
 
+/* ===---------------------=== */
+/* ===-------- llvm -------=== */
+/* ===---------------------=== */
+
+// holds many core datastrcutres and tables. no need to understand.
+static llvm::LLVMContext TheContext;
+// helper for creating llvm instructions.
+static llvm::IRBuilder<> Builder(TheContext);
+// owns memory for values and functions and global variables. its 
+// handling of memory means that Value is a naked ptr and not a
+// std::unique_ptr.
+static std::unique_ptr<llvm::Module> TheModule;
+// our symbol table. as it stands this wil only hold function params.
+static std::map<std::string, Value*> NamedValues;
+// our optimizer passer
+// std::unique_ptr<llvm::legacy::FunctionPassManager> TheFPM;
+
+Value* log_error_v(const char* str) {
+  log_error(str);
+  return nullptr;
+}
+
+/* ===---- optimization ---=== */
+
+// void InitializeModuleAndPassManager(void) {
+//   // open a new module
+//   TheModule = llvm::make_unique<llvm::Module>("my cool jit", TheContext);
+
+//   // associate a pass manager
+//   TheFPM = llvm::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
+
+//   // Do simple "peephole" optimizations and bit-twiddling optzns.
+//   TheFPM->add(llvm::createInstructionCombiningPass());
+//   // Reassociate expressions.
+//   TheFPM->add(llvm::createReassociatePass());
+//   // Eliminate Common SubExpressions.
+//   TheFPM->add(llvm::createGVNPass());
+//   // Simplify the control flow graph (deleting unreachable blocks, etc).
+//   TheFPM->add(llvm::createCFGSimplificationPass());
+
+//   TheFPM->doInitialization();
+// }
+
+/* ===------ code gen -----=== */
+
+// numbers are represented with the ConstantFP class.
+Value* NumberExpr::codegen() {
+  return llvm::ConstantFP::get(TheContext, llvm::APFloat(val));
+}
+
+Value* VarExpr::codegen() {
+  Value* v = NamedValues[name];
+  if ( ! v )
+    return log_error_v("unknown variable name");
+  return v;
+}
+
+// specifics here: https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/LangImpl03.html#expression-code-generation
+Value* BinaryExpr::codegen() {
+  Value* l = left->codegen();
+  Value* r = right->codegen();
+  if ( ! (l && r) )
+    return nullptr;
+  
+  switch (op) {
+  case '+':
+    return Builder.CreateFAdd(l, r, "addtmp");
+  case '-':
+    return Builder.CreateFSub(l, r, "subtmp");
+  case '*':
+    return Builder.CreateFMul(l, r, "multmp");
+  case '<':
+    l = Builder.CreateFCmpULT(l, r, "cmptmp");
+    // convert bool to double. kaleidoscope only has a double type.
+    return Builder.CreateUIToFP(l, llvm::Type::getDoubleTy(TheContext),
+				"booltmp");
+  default:
+    return log_error_v("invalid binary operator");
+  }
+}
+
+Value* CallExpr::codegen() {
+  llvm::Function* callee_fn = TheModule->getFunction(callee);
+  
+  if ( ! callee_fn )
+    return log_error_v("unknown function reference");
+  
+  if ( callee_fn->arg_size() != args.size() )
+    return log_error_v("incorrect number of arguments passed to function.");
+  
+  std::vector<Value*> args_v;
+  
+  for (const auto& expr : args)
+    if ( auto code = expr->codegen() )
+      args_v.push_back(code);
+    else
+      return nullptr;
+  
+  return Builder.CreateCall(callee_fn, args_v, "calltmp");
+}
+
+
+llvm::Function* Prototype::codegen() {
+  // Create a vector of N doubles.
+  std::vector<llvm::Type*> doubles(args.size(),
+				   llvm::Type::getDoubleTy(TheContext));
+  // Create a function type that takes N doubles and returns a double.
+  llvm::FunctionType* FT =
+    llvm::FunctionType::get(llvm::Type::getDoubleTy(TheContext), doubles, false);
+  
+  // Create the actual function and install it in TheModule's symbol table.
+  llvm::Function* F =
+    llvm::Function::Create(FT, llvm::Function::ExternalLinkage, name, TheModule.get());
+
+  // Install all of the argument names.
+  unsigned idx = 0;
+  for(auto& Arg : F->args())
+    Arg.setName(args[idx++]);
+
+  // At this point, we have a function with no body. For extern functions this is fine,
+  // and for ones that we define we'll 
+  return F;
+}
+
+llvm::Function* Function::codegen() {
+  // look for an existing `extern` function.
+  llvm::Function* the_function = TheModule->getFunction(proto->getName());
+  
+  if( ! the_function)
+    the_function = proto->codegen();
+  if ( ! the_function)
+    return nullptr; // we failed.
+  if ( ! the_function->empty() )
+    // :(
+    return static_cast<llvm::Function*>(log_error_v("Functions can not be redefined."));
+
+  // Create a new block to start putting code in.
+  llvm::BasicBlock *BB = llvm::BasicBlock::Create(TheContext, "entry", the_function);
+  Builder.SetInsertPoint(BB);
+
+  NamedValues.clear();
+  for(auto& Arg : the_function->args())
+    NamedValues[Arg.getName()] = &Arg;
+
+  if ( Value* RetVal = body->codegen()) {
+    Builder.CreateRet(RetVal);
+    // Validate the generated code with some llvm magic.
+    llvm::verifyFunction(*the_function);
+
+    // TheFPM->run(*the_function);
+
+    return the_function;
+  }
+
+  // Something went wrong - cleanup
+  the_function->eraseFromParent();
+  return nullptr;
+}
+
+
+/* ===--------------------=== */
+/* ===------- Main -------=== */
+/* ===--------------------=== */
+
 static void handle_definition() {
-  if (parse_definition())
-    fprintf(stderr, "function definition.\n");
+  if (auto fn = parse_definition()) {
+    if (auto fnir = fn->codegen()) {
+      fprintf(stderr, "Read function definition: ");
+      fnir->print(llvm::errs());
+      fprintf(stderr, "\n");
+      //  InitializeModuleAndPassManager();
+    }
+  }
   else
     next_tok();
 }
 
 static void handle_extern() {
-  if (parse_extern())
-    fprintf(stderr, "extern.\n");
+  if (auto pr = parse_extern()) {
+    if (auto fnir = pr->codegen()) {
+      fprintf(stderr, "Read extern: ");
+      fnir->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
+  }
   else
     next_tok();
 }
 
 static void handle_top_level_expression() {
-  if (parse_top_level_expression())
-    fprintf(stderr, "expression.\n");
+  if (auto fn = parse_top_level_expression()) {
+    if (auto fnir = fn->codegen()) {
+      //      InitializeModuleAndPassManager();
+      fprintf(stderr, "Read top level expression.");
+      fnir->print(llvm::errs());
+      fprintf(stderr, "\n");
+    }
+  }
   else
     next_tok();
 }
@@ -415,10 +615,6 @@ static void main_loop() {
   }
 }
 
-/* ===--------------------=== */
-/* ===------- Main -------=== */
-/* ===--------------------=== */
-
 int main() {
   // install standard binary operators.
   // 1 is lowest.
@@ -431,10 +627,15 @@ int main() {
   fprintf(stderr, "ready> ");
   next_tok(); // prime token
 
+  //  InitializeModuleAndPassManager();
+  TheModule = llvm::make_unique<llvm::Module>("my cool JIT", TheContext);
+
+
   main_loop();
+
+  TheModule->print(llvm::errs(), nullptr);
 
   return 0;
 }
 
 
-#endif
