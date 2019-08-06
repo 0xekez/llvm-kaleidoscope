@@ -19,7 +19,8 @@
 // That makes some big assumptions about where your clang9 and llvm
 // files are, but you might be able to get the idea from there.
 
-#include "KaleidoscopeJIT.h"
+// #include "KaleidoscopeJIT.h"
+#include "my_jit.h"
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
@@ -73,6 +74,10 @@ enum Token{
   tok_else = -8,
   tok_for = -9,
   tok_in = -10,
+
+  // operators
+  tok_binary = -11,
+  tok_unary = -12,
 };
 
 // filled in if we are parsing a tok_id
@@ -110,6 +115,11 @@ static int get_next_tok() {
       return tok_for;
     if ( current_id_string == "in" )
       return tok_in;
+    if ( current_id_string == "binary" )
+      return tok_binary;
+    if ( current_id_string == "unary" )
+      return tok_unary;
+
     return tok_id;
   }
 
@@ -199,6 +209,16 @@ public:
   Value* codegen() override;
 };
 
+class UnaryExpr :  public Expr {
+private:
+  char op;
+  std::unique_ptr<Expr> operand;
+public:
+  UnaryExpr(char op, std::unique_ptr<Expr> operand):
+    op(op), operand(std::move(operand)) {}
+  Value* codegen() override;
+};
+
 class ForExpr : public Expr {
 private:
   std::string var_name;
@@ -231,11 +251,25 @@ class Prototype {
 private:
   std::string name;
   std::vector<std::string> args;
+  bool is_operator;
+  unsigned precedence;
+
 public:
-  Prototype(const std::string& name, std::vector<std::string> args):
-    name(name), args(args) {}
+  Prototype(const std::string& name, std::vector<std::string> args,
+	    bool is_operator, unsigned precedence):
+    name(name), args(args), is_operator(is_operator), precedence(precedence) {}
   llvm::Function* codegen();
-  std::string getName() { return name; }
+  const std::string getName() const { return name; }
+  
+  bool isUnaryOp() const { return is_operator && args.size() == 1; }
+  bool isBinaryOp() const { return is_operator && args.size() == 2; }
+
+  const char getOperatorName() const {
+    assert(isUnaryOp() || isBinaryOp());
+    return name.back();
+  }
+
+  unsigned getBinaryPrecedence() const { return precedence; }
 };
 
 // the actual function definition. functions own their prototypes.
@@ -433,6 +467,8 @@ static int get_tok_precedence() {
   return tok_p;
 }
 
+static std::unique_ptr<Expr> parse_unary();
+
 // bin-op-right ->
 //    | ('+' primary)*
 // @param prec the minimum precidence operator that this function
@@ -451,7 +487,7 @@ static std::unique_ptr<Expr> parse_b_op_right(int prec,
     int bin_op = current_tok;
     next_tok(); // eat the operator
 
-    auto right = parse_primary();
+    auto right = parse_unary();
     if ( ! right )
       return nullptr;
 
@@ -473,23 +509,71 @@ static std::unique_ptr<Expr> parse_b_op_right(int prec,
 // expression ->
 //    | primary b-op-right
 static std::unique_ptr<Expr> parse_expression() {
-  auto left = parse_primary();
+  auto left = parse_unary();
   if (! left )
     return nullptr;
   return parse_b_op_right(0, std::move(left));
 }
 
+// unary
+//    | primary
+//    | '!' unary
+static std::unique_ptr<Expr> parse_unary() {
+  if ( !isascii(current_tok) || current_tok == '(' || current_tok == ',' )
+    return parse_primary();
+
+  int op_code = current_tok;
+  next_tok(); // consume the op
+  if (auto operand = parse_unary())
+    return llvm::make_unique<UnaryExpr>(op_code, std::move(operand));
+  return nullptr;
+}
 
 /* ===---- functions ----=== */
 
 // prototype ->
 //    | id '(' id* ')'
+//    | binary <letter> number? (id, id)
 static std::unique_ptr<Prototype> parse_prototype() {
-  if (current_tok != tok_id)
-    return log_error_p("expected function name in prototype");
+  std::string fn_name;
 
-  std::string fn_name(std::move(current_id_string));
-  next_tok(); // consume the id
+  unsigned kind = 0; // 0 -> id, 1 -> unary, 2->binary
+  unsigned precedence = 30; // by default quite high
+
+  switch (current_tok) {
+    default:
+      return log_error_p("expected a function name in the prototype");
+    case tok_id:
+      fn_name = std::move(current_id_string);
+      next_tok(); // consume the ID
+      break;
+
+    case tok_binary:
+      next_tok(); // consume 'binary'
+      if ( ! isascii(current_tok) )
+	return log_error_p("expected a binary operator.");
+      fn_name = "binary";
+      fn_name += static_cast<char>(current_tok);
+      kind = 2;
+      next_tok(); // consume operator
+
+      if ( current_tok == tok_number ) {
+	if ( current_num_val < 1 || current_num_val > 100 )
+	  return log_error_p("invalid precedence, must be 1...100");
+	precedence = static_cast<unsigned>(current_num_val);
+	next_tok(); // comsume the number
+      }
+      break;
+
+    case tok_unary:
+      next_tok();
+      if ( ! isascii(current_tok) )
+	return log_error_p("expected a unary operator");
+      fn_name = std::string("unary") + static_cast<char>(current_tok);
+      kind = 1;
+      next_tok();
+      break;
+    }
 
   if (current_tok != '(')
     return log_error_p("expected '(' after function name");
@@ -497,12 +581,19 @@ static std::unique_ptr<Prototype> parse_prototype() {
   std::vector<std::string> arg_names;
   while ( next_tok() == tok_id )
     arg_names.push_back(std::move(current_id_string));
+
   if (current_tok != ')')
     return log_error_p("expected closing ')' in prototype");
   
   next_tok(); // eat ')'
 
-  return llvm::make_unique<Prototype>(std::move(fn_name), std::move(arg_names));
+  if ( kind && arg_names.size() != kind )
+    return log_error_p(std::string("invalid number of operands for binary/unary operator."
+		       " Expected" + std::to_string(kind) + ", got "
+				   + std::to_string(arg_names.size())).c_str());
+
+  return llvm::make_unique<Prototype>(std::move(fn_name), std::move(arg_names),
+				      kind != 0, precedence);
 }
 
 // definition -> 'def' prototype expression
@@ -526,7 +617,7 @@ static std::unique_ptr<Prototype> parse_extern() {
 // toplevelexpression -> expression
 static std::unique_ptr<Function> parse_top_level_expression() {
   if (auto e = parse_expression()) {
-    auto proto = llvm::make_unique<Prototype>("__anon_expr", std::vector<std::string>());
+    auto proto = llvm::make_unique<Prototype>("__anon_expr", std::vector<std::string>(), false, 30);
     return llvm::make_unique<Function>(std::move(proto), std::move(e));
   }
   return nullptr;
@@ -581,6 +672,20 @@ void InitializeModuleAndPassManager(void) {
 
 /* ===------ code gen -----=== */
 
+llvm::Function* getFunction(std::string name) {
+  // Is it in the current module?
+  if (auto* F = TheModule->getFunction(name))
+    return F;
+
+  // Does it exist somewhere else?
+  auto where = FunctionProtos.find(name);
+  if (where != FunctionProtos.end())
+    return where->second->codegen();
+
+  return nullptr;
+}
+
+
 // numbers are represented with the ConstantFP class.
 Value* NumberExpr::codegen() {
   return llvm::ConstantFP::get(TheContext, llvm::APFloat(val));
@@ -613,8 +718,24 @@ Value* BinaryExpr::codegen() {
     return Builder.CreateUIToFP(l, llvm::Type::getDoubleTy(TheContext),
 				"booltmp");
   default:
-    return log_error_v("invalid binary operator");
+    break; // there could be other ones that the user has defined
   }
+
+  llvm::Function* f = getFunction(std::string("binary") + op);
+  assert(f && std::string(std::string("binary operator ") + op + std::string(" not found")).c_str());
+
+  Value* ops[2] = { l, r };
+  return Builder.CreateCall(f, ops, "custom-binop");
+}
+
+Value* UnaryExpr::codegen() {
+  Value* operand_v = operand->codegen();
+  if ( ! operand_v )
+    return nullptr;
+
+  llvm::Function* f = getFunction(std::string("unary") + op);
+  if ( ! f ) return log_error_v("unknown unary operator");
+  return Builder.CreateCall(f, operand_v, "custom-unop");
 }
 
 Value* ForExpr::codegen() {
@@ -742,19 +863,6 @@ Value* IfExpr::codegen() {
   return PN;
 }
 
-llvm::Function* getFunction(std::string name) {
-  // Is it in the current module?
-  if (auto* F = TheModule->getFunction(name))
-    return F;
-
-  // Does it exist somewhere else?
-  auto where = FunctionProtos.find(name);
-  if (where != FunctionProtos.end())
-    return where->second->codegen();
-
-  return nullptr;
-}
-
 Value* CallExpr::codegen() {
   llvm::Function* callee_fn = getFunction(callee);
   
@@ -800,17 +908,18 @@ llvm::Function* Prototype::codegen() {
 
 llvm::Function* Function::codegen() {
   // Get its name.
-  std::string name = proto->getName();
+  auto &P = *proto;
+
   // Transfer ownership.
   FunctionProtos[proto->getName()] = std::move(proto);
   // look it up.
-  llvm::Function* the_function = getFunction(name);
-  
+  llvm::Function* the_function = getFunction(P.getName());
   if ( ! the_function)
     return nullptr; // we failed.
-  if ( ! the_function->empty() )
-    // :(
-    return static_cast<llvm::Function*>(log_error_v("Functions can not be redefined."));
+
+  // if its an operator, install it.
+  if (P.isBinaryOp())
+    bop_precedence[P.getOperatorName()] = P.getBinaryPrecedence();
 
   // Create a new block to start putting code in.
   llvm::BasicBlock *BB = llvm::BasicBlock::Create(TheContext, "entry", the_function);
@@ -835,6 +944,28 @@ llvm::Function* Function::codegen() {
   return nullptr;
 }
 
+/* ===--------------------=== */
+/* ===------- STDL -------=== */
+/* ===--------------------=== */
+
+
+#ifdef _WIN32
+#define DLLEXPORT __declspec(dllexport)
+#else
+#define DLLEXPORT
+#endif
+
+/// putchard - putchar that takes a double and returns 0.
+extern "C" DLLEXPORT double putchard(double X) {
+  fputc(static_cast<char>(X), stderr);
+  return 0;
+}
+
+/// printd - printf that takes a double prints it as "%f\n", returning 0.
+extern "C" DLLEXPORT double printd(double X) {
+  fprintf(stderr, "%f\n", X);
+  return 0;
+}
 
 /* ===--------------------=== */
 /* ===------- Main -------=== */
@@ -843,8 +974,7 @@ llvm::Function* Function::codegen() {
 static void handle_definition() {
   if (auto fn = parse_definition()) {
     if (auto fnir = fn->codegen()) {
-      fprintf(stderr, "Read function definition: ");
-      // fnir->print(llvm::errs());
+      fprintf(stderr, "Read function definition.");
       fprintf(stderr, "\n");
       TheJIT->addModule(std::move(TheModule));
       InitializeModuleAndPassManager();
@@ -857,8 +987,7 @@ static void handle_definition() {
 static void handle_extern() {
   if (auto pr = parse_extern()) {
     if (auto fnir = pr->codegen()) {
-      fprintf(stderr, "Read extern: ");
-      // fnir->print(llvm::errs());
+      fprintf(stderr, "Read extern.");
       fprintf(stderr, "\n");
       FunctionProtos[pr->getName()] = std::move(pr);
     }
@@ -893,14 +1022,11 @@ static void handle_top_level_expression() {
 
 static void main_loop() {
   while (true) {
-    fprintf(stderr, "ready> ");
     switch(current_tok) {
-    default:
-      handle_top_level_expression();
-      break;
     case tok_eof:
       return;
     case ';':
+      fprintf(stderr, "ready> ");
       next_tok();
       break;
     case tok_def:
@@ -908,6 +1034,9 @@ static void main_loop() {
       break;
     case tok_extern:
       handle_extern();
+      break;
+    default:
+      handle_top_level_expression();
       break;
     }
   }

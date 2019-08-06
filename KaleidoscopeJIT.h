@@ -123,12 +123,16 @@ namespace llvm {
 
 	return nullptr;
       }
-
+      
+      // string pool, global mutex, error reporting, etc..
       ExecutionSession ES;
+      
       std::shared_ptr<SymbolResolver> Resolver;
       std::unique_ptr<TargetMachine> TM;
       const DataLayout DL;
+      // can be used to add object files to the JIT
       ObjLayerT ObjectLayer;
+      // add LLVM modules to our JIT
       CompileLayerT CompileLayer;
       std::vector<VModuleKey> ModuleKeys;
     };
