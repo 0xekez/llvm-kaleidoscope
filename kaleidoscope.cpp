@@ -1,4 +1,26 @@
+// ============
+// Kaleidoscope
+// ============
+
+// This pretty closely follows LLVM's kaleidoscope tutorial. Other than
+// some tiny changes to variable names and namespaces its actually pretty
+// much the same. There are also some additional comments that I've
+// written as a reference to myself later. You can find the tutorial in
+// question at the link below. I'm quite liking it so far.
+
+// https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html
+
+// If you'd like to run this code or use it yourself, either go on the
+// turorial link and scroll down to where it says how to compile this, or
+// run the following command:
+
+// /opt/clang9/bin/clang++ -g -rdynamic kaleidoscope.cpp `/opt/clang9/bin/llvm-config --cxxflags --ldflags --system-libs --libs all` -O3 -o kaleidoscope
+
+// That makes some big assumptions about where your clang9 and llvm
+// files are, but you might be able to get the idea from there.
+
 #include "KaleidoscopeJIT.h"
+
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/IR/BasicBlock.h"
@@ -33,19 +55,25 @@ using Value = llvm::Value;
 // for everything that it sees. current_id_string and current_num_val
 // will be populated as appropriate if the current token is an id or
 // num.
-enum Token
-  {
-    // the end of a file
-    tok_eof = -1,
-
-    // commands
-    tok_def = -2,
-    tok_extern = -3,
-
-    // primary
-    tok_id = -4,
-    tok_number = -5,
-  };
+enum Token{
+  // the end of a file
+  tok_eof = -1,
+  
+  // commands
+  tok_def = -2,
+  tok_extern = -3,
+  
+  // primary
+  tok_id = -4,
+  tok_number = -5,
+  
+  // control flow
+  tok_if = -6,
+  tok_then = -7,
+  tok_else = -8,
+  tok_for = -9,
+  tok_in = -10,
+};
 
 // filled in if we are parsing a tok_id
 static std::string current_id_string;
@@ -72,6 +100,16 @@ static int get_next_tok() {
       return tok_def;
     if ( current_id_string == "extern" )
       return tok_extern;
+    if ( current_id_string == "if" )
+      return tok_if;
+    if ( current_id_string == "then" )
+      return tok_then;
+    if ( current_id_string == "else" )
+      return tok_else;
+    if ( current_id_string == "for" )
+      return tok_for;
+    if ( current_id_string == "in" )
+      return tok_in;
     return tok_id;
   }
 
@@ -150,6 +188,32 @@ public:
   Value *codegen() override;
 };
 
+class IfExpr : public Expr {
+private:
+  std::unique_ptr<Expr> _cond, _then, _else;
+public:
+  IfExpr(std::unique_ptr<Expr> _cond,
+	 std::unique_ptr<Expr> _then,
+	 std::unique_ptr<Expr> _else)
+    : _cond(std::move(_cond)), _then(std::move(_then)), _else(std::move(_else)) {}
+  Value* codegen() override;
+};
+
+class ForExpr : public Expr {
+private:
+  std::string var_name;
+  std::unique_ptr<Expr> start, end, step, body;
+public:
+  ForExpr(const std::string& var_name, std::unique_ptr<Expr> start,
+	  std::unique_ptr<Expr> end, std::unique_ptr<Expr> step,
+	  std::unique_ptr<Expr> body)
+    : var_name(var_name), start(std::move(start)), end(std::move(end)),
+      step(std::move(step)), body(std::move(body)) {}
+
+  Value* codegen() override;
+  std::string getVarName() { return var_name; }
+};
+
 class CallExpr : public Expr {
 private:
   std::string callee;
@@ -199,6 +263,7 @@ static int next_tok() {
 }
 
 static std::unique_ptr<Expr> parse_expression();
+static std::unique_ptr<Expr> parse_if();
 
 // Very, very, very simple error handling.
 std::unique_ptr<Expr> log_error(const char* str) {
@@ -232,6 +297,47 @@ static std::unique_ptr<Expr> parse_parens() {
   // eat ')'
   next_tok();
   return v;
+}
+
+// for <start>, <end>, <step> in <body>
+// the step value is optional.
+static std::unique_ptr<Expr> parse_for() {
+  next_tok(); // eat for
+  if (current_tok != tok_id)
+    return log_error("Expected id after 'for'");
+  std::string start_name = current_id_string;
+  next_tok(); // eat id
+
+  if (current_tok != '=')
+    return log_error(std::string("Expected '=' after '" + start_name + "' in for.").c_str());
+  next_tok(); // eat '='
+
+  auto start = parse_expression();
+  if (! start ) return nullptr;
+  if ( current_tok != ',' )
+    return log_error("Expected ',' after start (assignment) clause of for loop");
+  next_tok();
+
+  auto end = parse_expression();
+  if ( ! end ) return nullptr;
+
+  std::unique_ptr<Expr> step;
+  // optional step
+  if ( current_tok == ',' ){
+    next_tok();
+    step = parse_expression();
+    if ( ! step ) return nullptr;
+  }
+
+  if (current_tok != tok_in)
+    return log_error("Expected 'in' after for.");
+  next_tok();
+
+  auto body = parse_expression();
+  if ( ! body ) return nullptr;
+
+  return llvm::make_unique<ForExpr>(start_name, std::move(start), std::move(end),
+				    std::move(step), std::move(body));
 }
 
 // identifier ->
@@ -281,7 +387,35 @@ static std::unique_ptr<Expr> parse_primary() {
     return parse_number();
   case '(':
     return parse_parens();
+  case tok_if:
+    return parse_if();
+  case tok_for:
+    return parse_for();
   }
+}
+
+// if expr then expr else expr;
+static std::unique_ptr<Expr> parse_if() {
+  next_tok(); // eat if
+  
+  auto condition = parse_expression();
+  if (! condition)
+    return nullptr;
+  
+  if (current_tok != tok_then)
+    return log_error("expected 'then` after if expression");
+  next_tok(); // eat then
+  auto then = parse_expression();
+  if ( ! then ) return nullptr;
+  
+  if (current_tok != tok_else)
+    return log_error("expected `else` after then expression");
+  next_tok(); // eat else
+  auto _else = parse_expression();
+  if ( ! _else ) return nullptr;
+
+  return llvm::make_unique<IfExpr>(std::move(condition), std::move(then),
+				   std::move(_else));
 }
 
 /* ===---- binary ops ----=== */
@@ -481,6 +615,131 @@ Value* BinaryExpr::codegen() {
   default:
     return log_error_v("invalid binary operator");
   }
+}
+
+Value* ForExpr::codegen() {
+  Value* start_val = start->codegen();
+  if ( ! start_val ) return nullptr;
+  
+  // The body
+  llvm::Function* the_function = Builder.GetInsertBlock()->getParent();
+  llvm::BasicBlock* PreBB = Builder.GetInsertBlock();
+  llvm::BasicBlock* BodyBB = llvm::BasicBlock::Create(TheContext, "loop", the_function);
+
+  // Make a fallthrough from the current block to the loop block
+  Builder.CreateBr(BodyBB);
+
+  // Fill up the body
+  Builder.SetInsertPoint(BodyBB);
+  llvm::PHINode* variable = Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext),
+					      2, var_name.c_str());
+
+  variable->addIncoming(start_val, PreBB);
+  // Need to redefine anything we shadow so we save it now
+  Value* old_val = NamedValues[var_name];
+  NamedValues[var_name] = variable;
+
+  if ( ! body->codegen() )
+    return nullptr;
+
+  Value* step_val = nullptr;
+  if (step) {
+    step_val = step->codegen();
+    if ( ! step_val ) return nullptr;
+  } else {
+    // default to 1
+    step_val = llvm::ConstantFP::get(TheContext, llvm::APFloat(1.0));
+  }
+  // add the step to the loop variable
+  Value* NextVar = Builder.CreateFAdd(variable, step_val, "nextvar");
+
+  Value* end_cond = end->codegen();
+  if ( ! end_cond ) return nullptr;
+
+  // convert to a bool. as before, only 0.0 is false.
+  end_cond = Builder.CreateFCmpONE(end_cond, llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)), "loopcond");
+
+  // should the loop exit?
+  llvm::BasicBlock* LoopEndBB = Builder.GetInsertBlock();
+  llvm::BasicBlock* AfterBB = llvm::BasicBlock::Create(TheContext, "afterloop", the_function);
+
+  // insert conditional
+  Builder.CreateCondBr(end_cond, BodyBB, AfterBB);
+
+  // code after the loop goes into afterbb
+  Builder.SetInsertPoint(AfterBB);
+
+  // cleanup
+  variable->addIncoming(NextVar, LoopEndBB);
+
+  // restore the shadowed variables
+  if (old_val)
+    NamedValues[var_name] = old_val;
+  else
+    NamedValues.erase(var_name);
+
+  return llvm::Constant::getNullValue(llvm::Type::getDoubleTy(TheContext));
+}
+
+Value* IfExpr::codegen() {
+  Value* cond_val = _cond->codegen();
+  if ( ! cond_val ) return nullptr;
+
+  // The only thing that is false is 0.0.
+  // convert cond_val to a bool by comparing /= false.
+  cond_val = Builder.CreateFCmpONE(cond_val, 
+				   llvm::ConstantFP::get(TheContext, llvm::APFloat(0.0)), 
+				   "ifcond");
+  // build the blocks for our if statement
+  llvm::Function* the_function = Builder.GetInsertBlock()->getParent();
+
+  llvm::BasicBlock* ThenBB =
+    llvm::BasicBlock::Create(TheContext, "then", the_function);
+  llvm::BasicBlock *ElseBB = llvm::BasicBlock::Create(TheContext, "else");
+  llvm::BasicBlock *MergeBB = llvm::BasicBlock::Create(TheContext, "ifcont");
+
+  Builder.CreateCondBr(cond_val, ThenBB, ElseBB);
+
+  // Emit then.
+  Builder.SetInsertPoint(ThenBB);
+  Value* then_val = _then->codegen();
+  if ( ! then_val ) return nullptr;
+
+  Builder.CreateBr(MergeBB);
+  // later we'd like to go back and keep executing from the end point of the 
+  // then block, we go ahead an set the then block to where all of the code wrapped
+  // up here. It might seem silly, but the reason we have to update it is because
+  // everything is an expression and the current insert block could have moved
+  // if there were more if expressions in the condition.
+  ThenBB = Builder.GetInsertBlock();
+
+  // Emit else.
+  // now that the then has been attached we can attach the else.
+  the_function->getBasicBlockList().push_back(ElseBB);
+  Builder.SetInsertPoint(ElseBB);
+
+  Value* else_val = _else->codegen();
+  if ( ! else_val ) return nullptr;
+
+  Builder.CreateBr(MergeBB);
+  // same as above long comment, possible the insert block has changed during
+  // the code generation.
+  ElseBB = Builder.GetInsertBlock();
+
+  // Emit merge block
+  the_function->getBasicBlockList().push_back(MergeBB);
+  Builder.SetInsertPoint(MergeBB);
+  
+  // a phi-node is something that before this I did not know existed.
+  // basically, it remembers where the flow is coming from and uses the value
+  // that comes from that section of the code. This makes it possible to
+  // deal with emitting LLVM IR without doing a bunch of complicated stuff
+  // that we will have to do later anyway :)
+  llvm::PHINode* PN = Builder.CreatePHI(llvm::Type::getDoubleTy(TheContext), 2, "iftmp");
+
+  PN->addIncoming(then_val, ThenBB);
+  PN->addIncoming(else_val, ElseBB);
+  return PN;
 }
 
 llvm::Function* getFunction(std::string name) {

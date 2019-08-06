@@ -12,8 +12,7 @@ https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html
 
 If you'd like to run this code or use it yourself, either go on the
 turorial link and scroll down to where it says how to compile this, or
-run the following command:
+run the equivalent of the following command on your machine:
 
-`clang++ -g -O3 kaleidoscope.cpp `llvm-config --cxxflags --ldflags \
---system-libs --libs core` -o kaleidoscope`
+/opt/clang9/bin/clang++ -g -rdynamic kaleidoscope.cpp `/opt/clang9/bin/llvm-config --cxxflags --ldflags --system-libs --libs all` -O3 -o kaleidoscope
 
