@@ -1,3 +1,12 @@
+/**
+ * This file is an exact copy of the chapter 7 code from LLVM's build
+ * your own language tutorial with the minimum number of modifications
+ * possible to make the code compile. The reasons for the
+ * modifications are that LLVM's build your own JIT tutorial includes
+ * a slightly different API than the one provided for the tutorial
+ * that this file is from.
+ */
+
 #include "JIT_baseline.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
@@ -944,7 +953,7 @@ Function *FunctionAST::codegen() {
 static void InitializeModuleAndPassManager() {
     // Open a new module.
     TheModule = llvm::make_unique<Module>("my cool jit", TheContext);
-    TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+    TheModule->setDataLayout(TheJIT->getDataLayout());
 
     // Create a new pass manager attached to it.
     TheFPM = llvm::make_unique<legacy::FunctionPassManager>(TheModule.get());
@@ -967,7 +976,8 @@ static void HandleDefinition() {
 	    fprintf(stderr, "Read function definition:");
 	    FnIR->print(errs());
 	    fprintf(stderr, "\n");
-	    TheJIT->addModule(std::move(TheModule));
+	    auto add_q = TheJIT->addModule(std::move(TheModule));
+	    assert(add_q && "HandleDefinition: Error adding a module.");
 	    InitializeModuleAndPassManager();
 	}
     } else {
@@ -1000,16 +1010,17 @@ static void HandleTopLevelExpression() {
 	    InitializeModuleAndPassManager();
 
 	    // Search the JIT for the __anon_expr symbol.
-	    auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
+	    auto ExprSymbol = TheJIT->lookup("__anon_expr");
 	    assert(ExprSymbol && "Function not found");
 
 	    // Get the symbol's address and cast it to the right type (takes no
 	    // arguments, returns a double) so we can call it as a native function.
-	    double (*FP)() = (double (*)())(intptr_t)cantFail(ExprSymbol.getAddress());
+	    double (*FP)() = (double (*)())(intptr_t)ExprSymbol->getAddress();
 	    fprintf(stderr, "Evaluated to %f\n", FP());
 
+	    //!! ORCv2 does not support module removal.
 	    // Delete the anonymous expression module from the JIT.
-	    TheJIT->removeModule(H);
+	    // TheJIT->removeModule(H);
 	}
     } else {
 	// Skip token for error recovery.
@@ -1082,7 +1093,9 @@ int main() {
     fprintf(stderr, "ready> ");
     getNextToken();
 
-    TheJIT = llvm::make_unique<KaleidoscopeJIT>();
+    auto jit_q = KaleidoscopeJIT::Create();
+    assert(jit_q && "Failed to create the JIT");
+    TheJIT = std::move(*jit_q);
 
     InitializeModuleAndPassManager();
 
