@@ -20,7 +20,9 @@
 // files are, but you might be able to get the idea from there.
 
 // #include "KaleidoscopeJIT.h"
-#include "my_jit.h"
+// #include "my_jit.h"
+// #include "orcJITv2.h"
+#include "JIT_baseline.h"
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
@@ -653,7 +655,7 @@ Value* log_error_v(const char* str) {
 void InitializeModuleAndPassManager(void) {
   // open a new module
   TheModule = llvm::make_unique<llvm::Module>("my cool jit", TheContext);
-  TheModule->setDataLayout(TheJIT->getTargetMachine().createDataLayout());
+  TheModule->setDataLayout(TheJIT->getDataLayout());
 
   // associate a pass manager
   TheFPM = llvm::make_unique<llvm::legacy::FunctionPassManager>(TheModule.get());
@@ -976,7 +978,8 @@ static void handle_definition() {
     if (auto fnir = fn->codegen()) {
       fprintf(stderr, "Read function definition.");
       fprintf(stderr, "\n");
-      TheJIT->addModule(std::move(TheModule));
+      auto q = TheJIT->addModule(std::move(TheModule));
+      assert(q && "failed to add a module");
       InitializeModuleAndPassManager();
     }
   }
@@ -1001,19 +1004,35 @@ static void handle_top_level_expression() {
     if (fn->codegen()) {
       // JIT the module containing the anonymous expression, keep a
       // handle so that we can free later.
-      auto H = TheJIT->addModule(std::move(TheModule));
+      auto q = TheJIT->addModule(std::move(TheModule));
+      assert(q && "failed to add a module");
       InitializeModuleAndPassManager();
 
       // Search the JIT for the __anon_expr symbol.
-      auto ExprSymbol = TheJIT->findSymbol("__anon_expr");
-      assert(ExprSymbol && "Function not found");
+      auto expr_q = TheJIT->lookup("__anon_expr");
+      assert(expr_q && "Function not found");
+      
+      // TODO(zeke): The reason we use an assert here rather than
+      // returning + printing an error here is becase if that goes
+      // wrong, something has gone very wrong. I dislike this approach
+      // though because as soon as we start compiling in non-debug
+      // mode the assert will be removed and we'll have no
+      // guard. Worth thinking deelpy later about rather or not we
+      // should __slow down__ release builds and just check that
+      // always.
+
+      auto ExprSymbol = std::move(*expr_q);
 
       // Get the symbol's address and cast it to the right type (takes no
       // arguments, returns a double) so we can call it as a native function.
-      double (*FP)() = (double (*)())(intptr_t)(ExprSymbol.getAddress().get());
+      double (*FP)() = (double (*)())(intptr_t)(ExprSymbol.getAddress());
       fprintf(stderr, "Evaluated to %f\n", FP());
 
-      TheJIT->removeModule(H);
+      // TODO(zeke): Is there a better way to do this? AFIK ORCv2
+      // doesn't currently support removing modules, which is fine as
+      // long as we're not leaking memory or murdering performance by
+      // not being able to.
+      // TheJIT->removeModule(H);
     }
   }
   else
@@ -1059,7 +1078,13 @@ int main() {
   fprintf(stderr, "ready> ");
   next_tok(); // prime token
 
-  TheJIT = llvm::make_unique<llvm::orc::KaleidoscopeJIT>();
+  auto jit_q = llvm::orc::KaleidoscopeJIT::Create();
+  if ( ! jit_q ){
+      log_error("Failed to initialize the JIT compiler. Terminating.");
+      return 1;
+  }
+  TheJIT = std::move(*jit_q);
+
   InitializeModuleAndPassManager();
 
   main_loop();
