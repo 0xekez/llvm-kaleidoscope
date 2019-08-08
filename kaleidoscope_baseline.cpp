@@ -372,6 +372,7 @@ static std::unique_ptr<ExprAST> ParseIdentifierExpr() {
     // Eat the ')'.
     getNextToken();
 
+    // fprintf(stderr, "Parsed an ID expression with %lu arguments and name %s", Args.size(), IdName.c_str());
     return llvm::make_unique<CallExprAST>(IdName, std::move(Args));
 }
 
@@ -727,7 +728,7 @@ Value *CallExprAST::codegen() {
 
     // If argument mismatch error.
     if (CalleeF->arg_size() != Args.size())
-	return LogErrorV("Incorrect # arguments passed");
+	return LogErrorV("Incorrect # arguments passed to function");
 
     std::vector<Value *> ArgsV;
     for (unsigned i = 0, e = Args.size(); i != e; ++i) {
@@ -977,7 +978,7 @@ static void HandleDefinition() {
 	    FnIR->print(errs());
 	    fprintf(stderr, "\n");
 	    auto add_q = TheJIT->addModule(std::move(TheModule));
-	    assert(add_q && "HandleDefinition: Error adding a module.");
+	    assert(!add_q && "HandleDefinition: Error adding a module.");
 	    InitializeModuleAndPassManager();
 	}
     } else {

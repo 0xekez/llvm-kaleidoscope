@@ -79,9 +79,9 @@ namespace llvm {
 	     * Adds a module to the JIT. Does not compile the module
 	     * until a lookup is performed on it.
 	     */
-	    void addModule(std::unique_ptr<Module> M) {
-		cantFail(CompileLayer.add(ES.getMainJITDylib(),
-					  ThreadSafeModule(std::move(M), Ctx)));
+	    Error addModule(std::unique_ptr<Module> M) {
+		return CompileLayer.add(ES.getMainJITDylib(),
+					  ThreadSafeModule(std::move(M), Ctx));
 	    }
 
 	    /**

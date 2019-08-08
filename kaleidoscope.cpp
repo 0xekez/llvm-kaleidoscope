@@ -979,7 +979,8 @@ static void handle_definition() {
       fprintf(stderr, "Read function definition.");
       fprintf(stderr, "\n");
       auto q = TheJIT->addModule(std::move(TheModule));
-      assert(q && "failed to add a module");
+      //!! Error here.
+      assert(!q && "Definition: failed to add a module");
       InitializeModuleAndPassManager();
     }
   }
@@ -1005,12 +1006,12 @@ static void handle_top_level_expression() {
       // JIT the module containing the anonymous expression, keep a
       // handle so that we can free later.
       auto q = TheJIT->addModule(std::move(TheModule));
-      assert(q && "failed to add a module");
+      assert(!q && "TopLevelExpression: failed to add a module");
       InitializeModuleAndPassManager();
 
       // Search the JIT for the __anon_expr symbol.
       auto expr_q = TheJIT->lookup("__anon_expr");
-      assert(expr_q && "Function not found");
+      assert(expr_q && "TopLevelExpression: function not found");
       
       // TODO(zeke): The reason we use an assert here rather than
       // returning + printing an error here is becase if that goes
