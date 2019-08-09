@@ -2,17 +2,46 @@
 Kaleidoscope
 ============
 
-This pretty closely follows LLVM's kaleidoscope tutorial. Other than
-some tiny changes to variable names and namespaces its actually pretty
-much the same. There are also some additional comments that I've
-written as a reference to myself later. You can find the tutorial in
-question at the link below. I'm quite liking it so far.
+This closely follows LLVM's kaleidoscope and building a JIT
+tutorials. It only makes a deviation from their tutorials in a couple
+places:
+
+- This modifies the kaleidoscope code to work with a JIT compiler
+  using ORCv2.
+- This includes a JIT compiler using ORCv2 following along with LLVM's
+  tutorials on building one.
+- This adds a couple comments and other notes for my own personal
+  reference.
+
+I have gotten in touch with the LLVM folks and they are working on
+getting the kaleidoscope tutorial to play nice with ORCv2 but until
+then this might serve as a nice reference to people interested in
+using kaleidoscope with the newer JIT compiler.
+
+You can find the tutorial on building kaleidoscope below. I'm quite
+liking it so far:
 
 https://llvm.org/docs/tutorial/MyFirstLanguageFrontend/index.html
 
-If you'd like to run this code or use it yourself, either go on the
-turorial link and scroll down to where it says how to compile this, or
-run the equivalent of the following command on your machine:
+Building & Running
+------------------
 
-/opt/clang9/bin/clang++ -g -rdynamic kaleidoscope.cpp `/opt/clang9/bin/llvm-config --cxxflags --ldflags --system-libs --libs all` -O3 -o kaleidoscope
+If you'd like to build this repo you'll need a LLVM and Clang version
+8 or greater. On MAC you can install LLVM with Homebew. Once you have
+those installed, go ahead and run this command:
 
+clang++ -g kaleidoscope_baseline.cpp `llvm-config --cxxflags --ldflags
+--system-libs --libs all` -O3 -o kaleidoscope
+
+Start the repl by running `./kaleidoscope` and try your first program:
+
+ready> def fib(n) if (n < 2) then n else fib(n - 1) + fib(n - 2);
+Read function definition.
+ready> fib(40);
+Evaluated to 102334155.000000
+
+
+The language is still pretty light on features, but I'd like to add
+some more to it. That will start out with work on the JIT compiler and
+then I'd like to use the visitor pattern under the hood and add some
+support for non-repl interaction.

@@ -48,8 +48,7 @@ namespace llvm {
 		DL(std::move(DL)), Mangle(ES, this->DL),
 		Ctx(llvm::make_unique<LLVMContext>()) {
 		ES.getMainJITDylib().setGenerator(
-						  cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(
-													       DL.getGlobalPrefix())));
+		    cantFail(DynamicLibrarySearchGenerator::GetForCurrentProcess(DL)));
 	    }
 
 	    /**
@@ -80,8 +79,7 @@ namespace llvm {
 	     * until a lookup is performed on it.
 	     */
 	    Error addModule(std::unique_ptr<Module> M) {
-		return CompileLayer.add(ES.getMainJITDylib(),
-					  ThreadSafeModule(std::move(M), Ctx));
+		return CompileLayer.add(ES.getMainJITDylib(), ThreadSafeModule(std::move(M), Ctx));
 	    }
 
 	    /**

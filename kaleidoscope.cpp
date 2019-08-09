@@ -21,8 +21,9 @@
 
 // #include "KaleidoscopeJIT.h"
 // #include "my_jit.h"
-// #include "orcJITv2.h"
-#include "JIT_baseline.h"
+
+//#include "JIT_baseline.h"
+#include "orcJITv2.h"
 
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/STLExtras.h"
@@ -294,6 +295,11 @@ public:
 // at, next_tok gets the next token, stores it in current_tok and yields
 // that token. this allows for simple lookahead.
 static int current_tok;
+// Count of how many anonymous expressions have been installed. Needed because
+// ORCv2 can't remove modules and as such needs to give every anonymous expr a
+// unique name.
+static unsigned anon_count = 0;
+
 static int next_tok() {
   return current_tok = get_next_tok();
 }
@@ -619,7 +625,8 @@ static std::unique_ptr<Prototype> parse_extern() {
 // toplevelexpression -> expression
 static std::unique_ptr<Function> parse_top_level_expression() {
   if (auto e = parse_expression()) {
-    auto proto = llvm::make_unique<Prototype>("__anon_expr", std::vector<std::string>(), false, 30);
+    auto proto = llvm::make_unique<Prototype>(std::string("__anon_expr") + std::to_string(anon_count),
+      std::vector<std::string>(), false, 30);
     return llvm::make_unique<Function>(std::move(proto), std::move(e));
   }
   return nullptr;
@@ -978,9 +985,10 @@ static void handle_definition() {
     if (auto fnir = fn->codegen()) {
       fprintf(stderr, "Read function definition.");
       fprintf(stderr, "\n");
-      auto q = TheJIT->addModule(std::move(TheModule));
-      //!! Error here.
-      assert(!q && "Definition: failed to add a module");
+
+      auto error_q = TheJIT->addModule(std::move(TheModule));
+      assert(!error_q && "HandleDefinition: failed to add a module");
+
       InitializeModuleAndPassManager();
     }
   }
@@ -1005,13 +1013,13 @@ static void handle_top_level_expression() {
     if (fn->codegen()) {
       // JIT the module containing the anonymous expression, keep a
       // handle so that we can free later.
-      auto q = TheJIT->addModule(std::move(TheModule));
-      assert(!q && "TopLevelExpression: failed to add a module");
+      auto error_q = TheJIT->addModule(std::move(TheModule));
+      assert(!error_q && "TopLevelExpression: failed to add a module");
       InitializeModuleAndPassManager();
 
       // Search the JIT for the __anon_expr symbol.
-      auto expr_q = TheJIT->lookup("__anon_expr");
-      assert(expr_q && "TopLevelExpression: function not found");
+      auto ExprSymbol= TheJIT->lookup(std::string("__anon_expr") + std::to_string(anon_count++));
+      assert(ExprSymbol && "TopLevelExpression: Function not found");
       
       // TODO(zeke): The reason we use an assert here rather than
       // returning + printing an error here is becase if that goes
@@ -1022,11 +1030,10 @@ static void handle_top_level_expression() {
       // should __slow down__ release builds and just check that
       // always.
 
-      auto ExprSymbol = std::move(*expr_q);
-
       // Get the symbol's address and cast it to the right type (takes no
       // arguments, returns a double) so we can call it as a native function.
-      double (*FP)() = (double (*)())(intptr_t)(ExprSymbol.getAddress());
+      double (*FP)() = (double (*)())(intptr_t)(ExprSymbol->getAddress());
+
       fprintf(stderr, "Evaluated to %f\n", FP());
 
       // TODO(zeke): Is there a better way to do this? AFIK ORCv2
