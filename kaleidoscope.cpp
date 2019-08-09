@@ -943,7 +943,7 @@ llvm::Function* Function::codegen() {
     // Validate the generated code with some llvm magic.
     llvm::verifyFunction(*the_function);
 
-    TheFPM->run(*the_function);
+//    TheFPM->run(*the_function);
 
     return the_function;
   }
